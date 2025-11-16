@@ -1,4 +1,8 @@
-# bubbl
+<div align="center">
+  <img src="bubbles.jpg">
+</div>
+
+<hr>
 
 CLI history logger tool for spotify.
 
