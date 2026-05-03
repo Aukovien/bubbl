@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ import (
 	"golang.org/x/oauth2/spotify"
 )
 
-// --- Constants ---
+// Constants
 const (
 	redirectURI         = "http://127.0.0.1:8888/callback"
 	historyFileName     = "spotify_history.json"
@@ -30,16 +31,45 @@ const (
 	configFile          = "config.json"
 	monitorInterval     = 30 * time.Second
 	syncInterval        = 30 * time.Minute
+	maxLogLines         = 50 // internal buffer; display cap is dynamic
 )
 
-// --- Structs ---
+// Styles
+var (
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("205")).
+			MarginBottom(1)
+
+	statusStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("244"))
+
+	logHeaderStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("241")).
+			MarginTop(1)
+
+	logLineStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("252"))
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Bold(true)
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("238")).
+			MarginTop(1)
+)
+
+// Structs
 type Config struct {
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
 }
 
 type UserProfile struct {
-	ID string `json:"id"`
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
 }
 
 type Artist struct {
@@ -60,7 +90,6 @@ type CurrentlyPlaying struct {
 		URI     string   `json:"uri"`
 		Artists []Artist `json:"artists"`
 	} `json:"item"`
-
 	IsPlaying bool `json:"is_playing"`
 }
 
@@ -88,26 +117,30 @@ type PlaylistTracksPaging struct {
 	Next  string          `json:"next"`
 }
 
-// --- Bubble Tea Model ---
+// Bubble Tea Model
 type model struct {
-	config     *oauth2.Config
-	client     *http.Client
-	userID     string
-	playlistID string
-	history    map[string]SimplifiedTrack
-	spinner    spinner.Model
-	status     string
-	logs       []string
-	err        error
-	quitting   bool
+	config      *oauth2.Config
+	client      *http.Client
+	userID      string
+	displayName string
+	playlistID  string
+	history     map[string]SimplifiedTrack
+	spinner     spinner.Model
+	status      string
+	logs        []string
+	err         error
+	quitting    bool
+	width       int
+	height      int
 }
 
-// --- Bubble Tea Messages (Events) ---
+// Bubble Tea Messages
 type setupDoneMsg struct {
-	client     *http.Client
-	userID     string
-	playlistID string
-	history    map[string]SimplifiedTrack
+	client      *http.Client
+	userID      string
+	displayName string
+	playlistID  string
+	history     map[string]SimplifiedTrack
 }
 
 type newTracksMsg struct{ tracks []SimplifiedTrack }
@@ -129,12 +162,12 @@ func syncTick() tea.Cmd {
 	})
 }
 
-// --- Main ---
+// Main
 func main() {
 	m := initialModel()
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
+		fmt.Printf("Alas, there's been an error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -148,11 +181,11 @@ func initialModel() model {
 		spinner: s,
 		status:  "Initializing and authenticating...",
 		history: make(map[string]SimplifiedTrack),
-		logs:    make([]string, 0, 15),
+		logs:    make([]string, 0, maxLogLines),
 	}
 }
 
-// --- Tea Init ---
+// Tea Init
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		m.spinner.Tick,
@@ -160,71 +193,40 @@ func (m model) Init() tea.Cmd {
 	)
 }
 
-func syncPlaylistToHistory(client *http.Client, playlistID string, history map[string]SimplifiedTrack) (map[string]SimplifiedTrack, int, error) {
-	url := fmt.Sprintf("https://api.spotify.com/v1/playlists/%s/tracks?limit=50", playlistID)
-	newTracksFound := 0
-
-	for url != "" {
-		resp, err := client.Get(url)
-		if err != nil {
-			return history, newTracksFound, err
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close() // Close body -- non-OK status
-			return history, newTracksFound, fmt.Errorf("failed to get playlist tracks: %s", resp.Status)
-		}
-
-		var playlistPage PlaylistTracksPaging
-		if err := json.NewDecoder(resp.Body).Decode(&playlistPage); err != nil {
-			resp.Body.Close() // Close body -- decode error
-			return history, newTracksFound, err
-		}
-
-		// close body inside loop
-		resp.Body.Close()
-
-		for _, item := range playlistPage.Items {
-			if _, exists := history[item.Track.ID]; !exists && item.Track.ID != "" {
-				history[item.Track.ID] = SimplifiedTrack{
-					ID:     item.Track.ID,
-					Name:   item.Track.Name,
-					Artist: getArtistsString(item.Track.Artists),
-					URI:    item.Track.URI,
-				}
-				newTracksFound++
-			}
-		}
-		url = playlistPage.Next // Get next page URL
-	}
-	return history, newTracksFound, nil
-}
-
-// --- Event loop ---
+// Event loop
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if msg, ok := msg.(errorMsg); ok {
-		m.err = msg.err
+	if errMsg, ok := msg.(errorMsg); ok {
+		m.err = errMsg.err
 		m.status = "A critical error occurred. Press 'q' to quit."
 		return m, nil
 	}
 
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
-		default:
-			return m, nil
 		}
+		return m, nil
 
 	case setupDoneMsg:
 		m.client = msg.client
 		m.userID = msg.userID
+		m.displayName = msg.displayName
 		m.playlistID = msg.playlistID
+		name := m.displayName
+		if name == "" {
+			name = m.userID
+		}
+		m.status = fmt.Sprintf("Monitoring '%s' → playlist '%s'", name, historyPlaylistName)
 		m.history = msg.history
-		m.status = fmt.Sprintf("Monitoring user '%s' on playlist '%s'", m.userID, historyPlaylistName)
-		m.addLog(fmt.Sprintf("Loaded/Synced %d tracks from local cache.", len(m.history)))
+		m.addLog(fmt.Sprintf("Loaded %d tracks from local cache.", len(m.history)))
 		m.addLog("Performing initial sync of recently played songs...")
 		return m, tea.Batch(
 			monitorTick(),
@@ -233,16 +235,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case monitorTickMsg:
-		var cmds []tea.Cmd
-		cmds = append(cmds, monitorTick())
+		cmds := []tea.Cmd{monitorTick()}
 		if m.client != nil {
 			cmds = append(cmds, checkCurrentlyPlaying(m.client))
 		}
 		return m, tea.Batch(cmds...)
 
 	case syncTickMsg:
-		var cmds []tea.Cmd
-		cmds = append(cmds, syncTick())
+		cmds := []tea.Cmd{syncTick()}
 		if m.client != nil {
 			cmds = append(cmds, syncRecentlyPlayed(m.client))
 		}
@@ -250,7 +250,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case newTracksMsg:
 		var newTracks []SimplifiedTrack
-		var tracksToAddCmd tea.Cmd
 		for _, track := range msg.tracks {
 			if _, exists := m.history[track.ID]; !exists {
 				m.history[track.ID] = track
@@ -259,8 +258,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if len(newTracks) > 0 {
-			tracksToAddCmd = addTracksToPlaylist(m.client, m.playlistID, newTracks)
-			return m, tea.Batch(tracksToAddCmd, saveHistory(m.history))
+			return m, tea.Batch(
+				addTracksToPlaylist(m.client, m.playlistID, newTracks),
+				saveHistory(m.history),
+			)
 		}
 		return m, nil
 
@@ -280,40 +281,73 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) addLog(s string) {
-	logLine := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), s)
-	m.logs = append(m.logs, logLine)
-	if len(m.logs) > 15 {
-		m.logs = m.logs[1:]
+	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), s)
+	m.logs = append(m.logs, line)
+	if len(m.logs) > maxLogLines {
+		m.logs = m.logs[len(m.logs)-maxLogLines:]
 	}
 }
 
-// --- Render ---
-func (m model) View() string {
-	if m.err != nil {
-		return fmt.Sprintf("\n%s\n\n%v\n\nPress 'q' to quit.", m.status, m.err)
+// visibleLogCount returns how many log lines fit in the current terminal.
+func (m model) visibleLogCount() int {
+	reserved := 9 // title, status, header, help, margins
+	available := m.height - reserved
+	if available < 3 {
+		return 3
 	}
+	if available > maxLogLines {
+		return maxLogLines
+	}
+	return available
+}
+
+// Render
+func (m model) View() string {
 	if m.quitting {
 		return "Shutting down...\n"
 	}
-	s := "Spotify History Monitor\n\n"
+
+	if m.err != nil {
+		return fmt.Sprintf("\n%s\n\n%s\n\n%s\n",
+			errorStyle.Render("Error: "+m.status),
+			m.err.Error(),
+			helpStyle.Render("Press 'q' to quit."),
+		)
+	}
+
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render("bubbl - Spotify History Monitor"))
+	b.WriteString("\n")
+
 	if m.client == nil {
-		s += m.spinner.View() + " " + m.status + "\n\n"
+		b.WriteString(m.spinner.View() + " " + statusStyle.Render(m.status) + "\n")
 	} else {
-		s += m.status + "\n\n"
+		b.WriteString(statusStyle.Render(m.status) + "\n")
 	}
-	s += "--- Activity Log ---\n"
-	for _, log := range m.logs {
-		s += log + "\n"
+
+	b.WriteString(logHeaderStyle.Render(" Activity Log "))
+	b.WriteString("\n")
+
+	visible := m.visibleLogCount()
+	start := 0
+	if len(m.logs) > visible {
+		start = len(m.logs) - visible
 	}
-	s += "\nPress 'q' to quit."
-	return s
+	for _, line := range m.logs[start:] {
+		b.WriteString(logLineStyle.Render(line) + "\n")
+	}
+
+	b.WriteString(helpStyle.Render("Press 'q' to quit."))
+	return b.String()
 }
 
-// --- Commands ---
+//  Commands
+
 func doInitialSetup() tea.Msg {
 	ctx := context.Background()
-	config, err := loadConfig()
 
+	config, err := loadConfig()
 	if err != nil {
 		return errorMsg{fmt.Errorf("error loading config.json: %w", err)}
 	}
@@ -331,68 +365,70 @@ func doInitialSetup() tea.Msg {
 	}
 
 	client, err := getClient(ctx, conf)
-
 	if err != nil {
 		return errorMsg{fmt.Errorf("could not get http client: %w", err)}
 	}
 
-	userID, err := getUserID(ctx, client)
-
+	userID, displayName, err := getUserID(ctx, client)
 	if err != nil {
 		return errorMsg{fmt.Errorf("could not get user ID: %w", err)}
 	}
 
-	history := loadHistory()
-	playlistID, err := getOrCreatePlaylist(ctx, client, userID, historyPlaylistName)
+	history, err := loadHistory()
+	if err != nil {
+		return errorMsg{fmt.Errorf("could not load history: %w", err)}
+	}
 
+	playlistID, err := getOrCreatePlaylist(ctx, client, userID, historyPlaylistName)
 	if err != nil {
 		return errorMsg{fmt.Errorf("could not get/create playlist: %w", err)}
 	}
 
-	history, newTracksFound, err := syncPlaylistToHistory(client, playlistID, history)
-
+	history, newTracksFound, err := syncPlaylistToHistory(ctx, client, playlistID, history)
 	if err != nil {
 		return errorMsg{fmt.Errorf("could not sync with playlist: %w", err)}
 	}
 
 	if newTracksFound > 0 {
-		fmt.Printf("Synced %d tracks from playlist to local history.\n", newTracksFound)
-		saveMsg := saveHistory(history)()
-		if saveMsg != nil {
-			if err, ok := saveMsg.(errorMsg); ok {
-				return err
-			}
+		if err := writeHistory(history); err != nil {
+			return errorMsg{fmt.Errorf("could not save synced history: %w", err)}
 		}
 	}
 
 	return setupDoneMsg{
-		client:     client,
-		userID:     userID,
-		playlistID: playlistID,
-		history:    history,
+		client:      client,
+		userID:      userID,
+		displayName: displayName,
+		playlistID:  playlistID,
+		history:     history,
 	}
 }
 
 func checkCurrentlyPlaying(client *http.Client) tea.Cmd {
 	return func() tea.Msg {
-		resp, err := client.Get("https://api.spotify.com/v1/me/player/currently-playing")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			"https://api.spotify.com/v1/me/player/currently-playing", nil)
+		if err != nil {
+			return logMsg(fmt.Sprintf("Error building currently-playing request: %v", err))
+		}
+
+		resp, err := client.Do(req)
 		if err != nil {
 			return logMsg(fmt.Sprintf("Error checking currently playing: %v", err))
 		}
-
 		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusNoContent {
 			return nil
 		}
-
 		if resp.StatusCode != http.StatusOK {
-			return logMsg("Error status from currently-playing endpoint")
+			return logMsg(fmt.Sprintf("Unexpected status from currently-playing: %s", resp.Status))
 		}
 
 		var current CurrentlyPlaying
-
 		if err := json.NewDecoder(resp.Body).Decode(&current); err != nil {
 			return logMsg(fmt.Sprintf("Error decoding currently playing: %v", err))
 		}
@@ -401,33 +437,37 @@ func checkCurrentlyPlaying(client *http.Client) tea.Cmd {
 			return nil
 		}
 
-		track := SimplifiedTrack{
+		return newTracksMsg{tracks: []SimplifiedTrack{{
 			ID:     current.Item.ID,
 			Name:   current.Item.Name,
 			Artist: getArtistsString(current.Item.Artists),
 			URI:    current.Item.URI,
-		}
-
-		return newTracksMsg{tracks: []SimplifiedTrack{track}}
+		}}}
 	}
 }
 
 func syncRecentlyPlayed(client *http.Client) tea.Cmd {
 	return func() tea.Msg {
-		var allNewTracks []SimplifiedTrack
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
+		var allTracks []SimplifiedTrack
 		url := "https://api.spotify.com/v1/me/player/recently-played?limit=50"
 
 		for url != "" {
-			resp, err := client.Get(url)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				return errorMsg{fmt.Errorf("error building recently-played request: %w", err)}
+			}
 
+			resp, err := client.Do(req)
 			if err != nil {
 				return errorMsg{fmt.Errorf("error fetching recently played: %w", err)}
 			}
 
 			if resp.StatusCode != http.StatusOK {
 				resp.Body.Close()
-				return errorMsg{fmt.Errorf("error status from recently-played endpoint")}
+				return errorMsg{fmt.Errorf("unexpected status from recently-played: %s", resp.Status)}
 			}
 
 			var result struct {
@@ -442,33 +482,30 @@ func syncRecentlyPlayed(client *http.Client) tea.Cmd {
 				Next string `json:"next"`
 			}
 
-			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-				resp.Body.Close()
+			err = json.NewDecoder(resp.Body).Decode(&result)
+			resp.Body.Close()
+			if err != nil {
 				return errorMsg{fmt.Errorf("error decoding recently played: %w", err)}
 			}
 
-			resp.Body.Close()
-
+			// Append oldest-first so history is in chronological order
 			for i := len(result.Items) - 1; i >= 0; i-- {
 				item := result.Items[i].Track
-				track := SimplifiedTrack{
+				allTracks = append(allTracks, SimplifiedTrack{
 					ID:     item.ID,
 					Name:   item.Name,
 					Artist: getArtistsString(item.Artists),
 					URI:    item.URI,
-				}
-
-				allNewTracks = append(allNewTracks, track)
+				})
 			}
 
 			url = result.Next
 		}
 
-		if len(allNewTracks) > 0 {
-			return newTracksMsg{tracks: allNewTracks}
+		if len(allTracks) > 0 {
+			return newTracksMsg{tracks: allTracks}
 		}
-
-		return logMsg("Periodic sync ran, 0 new tracks found.")
+		return logMsg("Periodic sync: 0 new tracks found.")
 	}
 }
 
@@ -479,115 +516,208 @@ func addTracksToPlaylist(client *http.Client, playlistID string, tracks []Simpli
 		}
 
 		url := fmt.Sprintf("https://api.spotify.com/v1/playlists/%s/tracks", playlistID)
+		total := 0
 
 		for i := 0; i < len(tracks); i += 100 {
 			end := i + 100
-
 			if end > len(tracks) {
 				end = len(tracks)
 			}
-
 			batch := tracks[i:end]
-			var uris []string
 
-			for _, track := range batch {
-				uris = append(uris, track.URI)
+			uris := make([]string, len(batch))
+			for j, t := range batch {
+				uris[j] = t.URI
 			}
 
-			body, _ := json.Marshal(map[string][]string{"uris": uris})
-			req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := client.Do(req)
-
+			body, err := json.Marshal(map[string][]string{"uris": uris})
 			if err != nil {
-				return errorMsg{fmt.Errorf("error adding tracks to playlist: %w", err)}
+				return errorMsg{fmt.Errorf("error marshalling track URIs: %w", err)}
 			}
 
-			resp.Body.Close()
+			if err := func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
 
-			if resp.StatusCode != http.StatusCreated {
-				return errorMsg{fmt.Errorf("failed to add tracks, status: %s", resp.Status)}
+				req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+				if err != nil {
+					return fmt.Errorf("error building add-tracks request: %w", err)
+				}
+				req.Header.Set("Content-Type", "application/json")
+
+				resp, err := client.Do(req)
+				if err != nil {
+					return fmt.Errorf("error adding tracks to playlist: %w", err)
+				}
+				defer resp.Body.Close()
+
+				if resp.StatusCode != http.StatusCreated {
+					return fmt.Errorf("failed to add tracks, status: %s", resp.Status)
+				}
+				return nil
+			}(); err != nil {
+				return errorMsg{err}
 			}
+
+			total += len(batch)
 		}
 
-		return tracksAddedMsg{count: len(tracks)}
+		return tracksAddedMsg{count: total}
 	}
 }
 
+// saveHistory is a tea.Cmd wrapper around writeHistory.
 func saveHistory(history map[string]SimplifiedTrack) tea.Cmd {
 	return func() tea.Msg {
-		file, err := os.Create(historyFileName)
-
-		if err != nil {
-			return errorMsg{fmt.Errorf("error creating history file: %w", err)}
+		if err := writeHistory(history); err != nil {
+			return errorMsg{err}
 		}
-
-		defer file.Close()
-		encoder := json.NewEncoder(file)
-		encoder.SetIndent("", "  ")
-
-		if err := encoder.Encode(history); err != nil {
-			return errorMsg{fmt.Errorf("error encoding history to file: %w", err)}
-		}
-
 		return nil
 	}
 }
 
-// --- Helper ---
+// writeHistory writes history to disk atomically via a temp file + rename,
+// preventing data loss if the process is killed mid-write.
+func writeHistory(history map[string]SimplifiedTrack) error {
+	dir := filepath.Dir(historyFileName)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, ".history-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("error creating temp history file: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	if encErr := enc.Encode(history); encErr != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("error encoding history: %w", encErr)
+	}
+
+	if closeErr := tmp.Close(); closeErr != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("error closing temp file: %w", closeErr)
+	}
+
+	if renErr := os.Rename(tmpName, historyFileName); renErr != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("error atomically saving history file: %w", renErr)
+	}
+
+	return nil
+}
+
+//  Spotify API helpers
+
+func syncPlaylistToHistory(ctx context.Context, client *http.Client, playlistID string, history map[string]SimplifiedTrack) (map[string]SimplifiedTrack, int, error) {
+	url := fmt.Sprintf("https://api.spotify.com/v1/playlists/%s/tracks?limit=50", playlistID)
+	newTracksFound := 0
+
+	for url != "" {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return history, newTracksFound, fmt.Errorf("error building playlist tracks request: %w", err)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return history, newTracksFound, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return history, newTracksFound, fmt.Errorf("failed to get playlist tracks: %s", resp.Status)
+		}
+
+		var page PlaylistTracksPaging
+		err = json.NewDecoder(resp.Body).Decode(&page)
+		resp.Body.Close()
+		if err != nil {
+			return history, newTracksFound, err
+		}
+
+		for _, item := range page.Items {
+			if item.Track.ID == "" {
+				continue // skip local/podcast tracks with no Spotify ID
+			}
+			if _, exists := history[item.Track.ID]; !exists {
+				history[item.Track.ID] = SimplifiedTrack{
+					ID:     item.Track.ID,
+					Name:   item.Track.Name,
+					Artist: getArtistsString(item.Track.Artists),
+					URI:    item.Track.URI,
+				}
+				newTracksFound++
+			}
+		}
+
+		url = page.Next
+	}
+
+	return history, newTracksFound, nil
+}
+
 func getClient(ctx context.Context, conf *oauth2.Config) (*http.Client, error) {
 	tokenFile := "spotify_token.json"
-	tok, err := tokenFromFile(tokenFile)
 
-	if err == nil {
-		fmt.Println("Using cached token.")
+	if tok, err := tokenFromFile(tokenFile); err == nil {
 		tokenSource := conf.TokenSource(ctx, tok)
 		newToken, err := tokenSource.Token()
-
 		if err != nil {
 			return nil, fmt.Errorf("could not refresh token: %w", err)
 		}
-
 		if newToken.AccessToken != tok.AccessToken {
-			fmt.Println("Token was refreshed.")
 			saveToken(tokenFile, newToken)
 		}
-
 		return oauth2.NewClient(ctx, tokenSource), nil
 	}
 
-	fmt.Println("Getting new token.")
-	ch := make(chan *oauth2.Token)
-	errCh := make(chan error)
-	server := &http.Server{Addr: ":8888"}
+	// OAuth flow: use a dedicated mux to avoid conflicts with the default ServeMux.
+	ch := make(chan *oauth2.Token, 1)
+	errCh := make(chan error, 1)
 
-	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	server := &http.Server{Addr: ":8888", Handler: mux}
+
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
 		exchangeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		tok, err := conf.Exchange(exchangeCtx, code)
 
+		tok, err := conf.Exchange(exchangeCtx, code)
 		if err != nil {
-			errCh <- fmt.Errorf("could not get token: %w", err)
+			errCh <- fmt.Errorf("could not exchange token: %w", err)
+			http.Error(w, "Authentication failed. You may close this window.", http.StatusInternalServerError)
 			return
 		}
 
+		// Write and flush the response BEFORE blocking on the channel send,
+		// so the browser gets the success page regardless of shutdown timing.
 		fmt.Fprint(w, "Authentication successful! You can close this window.")
-		go server.Shutdown(context.Background())
-		ch <- tok
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		ch <- tok // blocks until caller receives; handler returns cleanly after
 	})
 
 	go func() {
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			errCh <- fmt.Errorf("ListenAndServe(): %w", err)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- fmt.Errorf("OAuth server error: %w", err)
 		}
 	}()
 
-	url := conf.AuthCodeURL("state", oauth2.AccessTypeOffline)
-	fmt.Printf("Your browser should open for Spotify authentication. If not, please visit:\n%v\n", url)
-	openBrowser(url)
+	authURL := conf.AuthCodeURL("state", oauth2.AccessTypeOffline)
+	fmt.Printf("Opening browser for Spotify login. If it doesn't open, visit:\n%s\n", authURL)
+	openBrowser(authURL)
+
 	select {
 	case tok := <-ch:
+		// Shut down the server after receiving the token (not inside the handler),
+		// so the handler has already returned and the response is fully flushed.
+		go server.Shutdown(context.Background()) //nolint:errcheck
 		saveToken(tokenFile, tok)
 		return conf.Client(ctx, tok), nil
 	case err := <-errCh:
@@ -596,93 +726,111 @@ func getClient(ctx context.Context, conf *oauth2.Config) (*http.Client, error) {
 		return nil, ctx.Err()
 	}
 }
-func getUserID(ctx context.Context, client *http.Client) (string, error) {
-	resp, err := client.Get("https://api.spotify.com/v1/me")
 
+func getUserID(ctx context.Context, client *http.Client) (id, displayName string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.spotify.com/v1/me", nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to get user profile: %s", resp.Status)
+		return "", "", fmt.Errorf("failed to get user profile: %s", resp.Status)
 	}
 
 	var profile UserProfile
-
 	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return profile.ID, nil
+	return profile.ID, profile.DisplayName, nil
 }
 
-func loadHistory() map[string]SimplifiedTrack {
+// loadHistory reads the local history cache. Returns an empty map (no error)
+// if the file simply doesn't exist yet, and a real error for anything else.
+func loadHistory() (map[string]SimplifiedTrack, error) {
 	history := make(map[string]SimplifiedTrack)
-	file, err := os.Open(historyFileName)
 
+	file, err := os.Open(historyFileName)
 	if err != nil {
 		if os.IsNotExist(err) {
-			fmt.Println("History file not found, will create a new one.")
-			return history
+			return history, nil
 		}
-
-		log.Fatalf("Error opening history file: %v", err)
+		return nil, fmt.Errorf("error opening history file: %w", err)
 	}
-
 	defer file.Close()
 
 	if err := json.NewDecoder(file).Decode(&history); err != nil {
-		fmt.Printf("Could not decode history file, starting fresh: %v\n", err)
-		return make(map[string]SimplifiedTrack)
+		// Corrupted cache: warn and start fresh rather than crashing.
+		fmt.Fprintf(os.Stderr, "Warning: could not decode history file, starting fresh: %v\n", err)
+		return make(map[string]SimplifiedTrack), nil
 	}
 
-	return history
+	return history, nil
 }
+
 func getOrCreatePlaylist(ctx context.Context, client *http.Client, userID, name string) (string, error) {
 	url := "https://api.spotify.com/v1/me/playlists?limit=50"
 
 	for url != "" {
-		resp, err := client.Get(url)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return "", fmt.Errorf("error building playlists request: %w", err)
+		}
 
+		resp, err := client.Do(req)
 		if err != nil {
 			return "", err
 		}
 
-		var playlists PagingObject
-
-		if err := json.NewDecoder(resp.Body).Decode(&playlists); err != nil {
+		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
+			return "", fmt.Errorf("failed to list playlists: %s", resp.Status)
+		}
+
+		var playlists PagingObject
+		err = json.NewDecoder(resp.Body).Decode(&playlists)
+		resp.Body.Close()
+		if err != nil {
 			return "", err
 		}
 
-		resp.Body.Close() // close body
-
 		for _, item := range playlists.Items {
 			var p Playlist
-
-			if err := json.Unmarshal(item, &p); err == nil {
-				if p.Name == name {
-					return p.ID, nil
-				}
+			if err := json.Unmarshal(item, &p); err == nil && p.Name == name {
+				return p.ID, nil
 			}
 		}
+
 		url = playlists.Next
 	}
 
-	fmt.Printf("Playlist '%s' not found. Creating it...\n", name)
+	// Not found — create it.
+	payload, err := json.Marshal(map[string]any{
+		"name":        name,
+		"public":      false,
+		"description": "Listening history logged by bubbl.",
+	})
+	if err != nil {
+		return "", fmt.Errorf("error marshalling playlist payload: %w", err)
+	}
 
 	createURL := fmt.Sprintf("https://api.spotify.com/v1/users/%s/playlists", userID)
-	playlistData := strings.NewReader(fmt.Sprintf(`{"name":"%s", "public":false, "description":"Listening history logged by Go tool."}`, name))
-	req, _ := http.NewRequestWithContext(ctx, "POST", createURL, playlistData)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("error building create-playlist request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
 
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
-
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
@@ -691,7 +839,6 @@ func getOrCreatePlaylist(ctx context.Context, client *http.Client, userID, name 
 	}
 
 	var newPlaylist Playlist
-
 	if err := json.NewDecoder(resp.Body).Decode(&newPlaylist); err != nil {
 		return "", err
 	}
@@ -701,17 +848,13 @@ func getOrCreatePlaylist(ctx context.Context, client *http.Client, userID, name 
 
 func loadConfig() (*Config, error) {
 	file, err := os.Open(configFile)
-
 	if err != nil {
 		return nil, err
 	}
-
 	defer file.Close()
-	var config Config
-	decoder := json.NewDecoder(file)
-	err = decoder.Decode(&config)
 
-	if err != nil {
+	var config Config
+	if err := json.NewDecoder(file).Decode(&config); err != nil {
 		return nil, err
 	}
 
@@ -722,84 +865,89 @@ func loadConfig() (*Config, error) {
 	return &config, nil
 }
 
-func getArtistsString(artists []Artist) string {
-	var names []string
-	for _, artist := range artists {
-		names = append(names, artist.Name)
-	}
+//  Utility helpers
 
+func getArtistsString(artists []Artist) string {
+	names := make([]string, len(artists))
+	for i, a := range artists {
+		names[i] = a.Name
+	}
 	return strings.Join(names, ", ")
 }
 
 func tokenFromFile(file string) (*oauth2.Token, error) {
 	f, err := os.Open(file)
-
 	if err != nil {
 		return nil, err
 	}
-
 	defer f.Close()
+
 	tok := &oauth2.Token{}
-	err = json.NewDecoder(f).Decode(tok)
-
-	return tok, err
+	return tok, json.NewDecoder(f).Decode(tok)
 }
+
 func saveToken(path string, token *oauth2.Token) {
-	fmt.Printf("Saving credential file to: %s\n", path)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
-
 	if err != nil {
-		log.Fatalf("Unable to cache oauth token: %v", err)
+		log.Printf("Unable to cache oauth token: %v", err)
+		return
 	}
-
 	defer f.Close()
-	json.NewEncoder(f).Encode(token)
+	if err := json.NewEncoder(f).Encode(token); err != nil {
+		log.Printf("Unable to write oauth token: %v", err)
+	}
 }
 
 func openBrowser(url string) {
-	var err error
+	var cmd string
+	var args []string
 
 	switch runtime.GOOS {
 	case "linux":
-		err = exec.Command("xdg-open", url).Start()
+		cmd, args = "xdg-open", []string{url}
 	case "windows":
-		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+		cmd, args = "rundll32", []string{"url.dll,FileProtocolHandler", url}
 	case "darwin":
-		err = exec.Command("open", url).Start()
+		cmd, args = "open", []string{url}
 	default:
-		err = fmt.Errorf("unsupported platform")
+		log.Printf("Unsupported platform; open this URL manually: %s", url)
+		return
 	}
 
-	if err != nil {
+	if err := exec.Command(cmd, args...).Start(); err != nil {
 		log.Printf("Could not open browser: %v", err)
 	}
 }
 
+// init: interactive config bootstrapping
 func init() {
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
 		fmt.Println("config.json not found.")
-		fmt.Println("Please create it with your Spotify Client ID and Secret.")
+		fmt.Println("Please enter your Spotify App credentials.")
+
 		reader := bufio.NewReader(os.Stdin)
+
 		fmt.Print("Enter your Client ID: ")
 		clientID, _ := reader.ReadString('\n')
+
 		fmt.Print("Enter your Client Secret: ")
 		clientSecret, _ := reader.ReadString('\n')
+
 		config := Config{
 			ClientID:     strings.TrimSpace(clientID),
 			ClientSecret: strings.TrimSpace(clientSecret),
 		}
-		file, err := os.Create(configFile)
 
+		file, err := os.Create(configFile)
 		if err != nil {
 			log.Fatalf("Unable to create config.json: %v", err)
 		}
-
 		defer file.Close()
-		encoder := json.NewEncoder(file)
-		encoder.SetIndent("", "  ")
 
-		if err := encoder.Encode(config); err != nil {
-			log.Fatalf("Unable to write to config.json: %v", err)
+		enc := json.NewEncoder(file)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(config); err != nil {
+			log.Fatalf("Unable to write config.json: %v", err)
 		}
 
 		fmt.Println("config.json created successfully.")
