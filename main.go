@@ -126,7 +126,8 @@ type model struct {
 	playlistID  string
 	history     map[string]SimplifiedTrack
 	spinner     spinner.Model
-	status      string
+	status      string // current (possibly temporary) status line
+	idleStatus  string // baseline status to return to after an operation
 	logs        []string
 	err         error
 	quitting    bool
@@ -224,10 +225,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if name == "" {
 			name = m.userID
 		}
-		m.status = fmt.Sprintf("Monitoring '%s' → playlist '%s'", name, historyPlaylistName)
+		idle := fmt.Sprintf("Monitoring '%s' → playlist '%s'", name, historyPlaylistName)
+		m.status = idle
+		m.idleStatus = idle
 		m.history = msg.history
 		m.addLog(fmt.Sprintf("Loaded %d tracks from local cache.", len(m.history)))
 		m.addLog("Performing initial sync of recently played songs...")
+		m.status = "Syncing recently played..."
 		return m, tea.Batch(
 			monitorTick(),
 			syncTick(),
@@ -244,6 +248,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case syncTickMsg:
 		cmds := []tea.Cmd{syncTick()}
 		if m.client != nil {
+			m.status = "Syncing recently played..."
 			cmds = append(cmds, syncRecentlyPlayed(m.client))
 		}
 		return m, tea.Batch(cmds...)
@@ -258,15 +263,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if len(newTracks) > 0 {
+			m.status = fmt.Sprintf("Adding %d track(s) to playlist...", len(newTracks))
 			return m, tea.Batch(
 				addTracksToPlaylist(m.client, m.playlistID, newTracks),
 				saveHistory(m.history),
 			)
 		}
+		m.status = m.idleStatus
 		return m, nil
 
 	case tracksAddedMsg:
 		m.addLog(fmt.Sprintf("Successfully added %d track(s) to playlist.", msg.count))
+		m.status = m.idleStatus
 		return m, nil
 
 	case logMsg:
