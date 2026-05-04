@@ -1,50 +1,40 @@
 <div align="center">
-  <img src="bubbles.jpg">
+  <img src="bubbl.gif">
 </div>
-
-<hr>
-
-CLI history logger tool for spotify.
+<br>
+    
+CLI history logger for Spotify.
 
 ## 🌟 Features
-- Real-time Monitoring
-- Catch-up Sync: Performs a full sync of your recently played history to catch any songs missed between polls/downtime.
-- Automatic Playlist Creation: Creates a "History" playlist by default if it doesn't exist.
-- Intelligent Sync: On startup, it reads all tracks from your "History" playlist to prevent adding duplicates.
-- Local Cache: Saves a `.json` file to keep track of processed songs.
+- Polls every 30 seconds to catch what you're listening to
+- Syncs your recently played history on startup to fill any gaps
+- Creates a "History" playlist automatically if one doesn't exist
+- Reads existing playlist tracks on startup so nothing gets added twice
+- Saves a local `.json` cache to track everything it's seen
 
 ## ⚡ Requirements
-- Go **1.21+**
-- Git
-- Spotify Account.
+- Go 1.21+
+- A Spotify account
 
 ## 🚀 Setup
-### Create a Spotify App
-You need a `Client ID` and `Client Secret` to use **bubbl**.
-1. Go to the [Spotify Developer Dashboard](https://developer.spotify.com/).
-2. Log in and click **"Create app"**.
-3. Give your app a name and a description.
-4. Once created, you will see your `Client ID` and `Client Secret`. You will need these in a moment.
-5. Go to **"App settings"**.
-6. Find the **"Redirect URIs"** section.
-7. Add this exact URL: `http://127.0.0.1:8888/callback`
-8. Click **"Save"** at the bottom of the page.
 
-### Clone the Repository
-```bash
-# clone
-git clone https://github.com/Aukovien/bubbl.git
+### 1. Create a Spotify App
+Go to the [Spotify Developer Dashboard](https://developer.spotify.com/) and create a new app. Once created, go to App Settings and add this redirect URI
 
-# navigate into the new directory
-cd bubbl
+```
+http://127.0.0.1:8888/callback
 ```
 
-### Run
-1. Now run the program
+You'll need the Client ID and Client Secret for the next step.
+
+### 2. Clone and run
+
 ```bash
+git clone https://github.com/Aukovien/bubbl.git
+cd bubbl
 go run .
 ```
-2. You will be prompted to enter the `Client ID` and `Client Secret` you got from Step 1. 
-3. Log in via the new tab opened on your browser. Click **"Agree"**.
 
-That's it! You can just leave it running in a terminal window.
+Paste in your Client ID and Client Secret when prompted, then log in via the browser tab that opens.
+
+After that first login your token is cached locally so you won't need to authenticate again. Just leave it running in a terminal.
