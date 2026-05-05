@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"golang.org/x/oauth2"
@@ -25,13 +27,12 @@ import (
 
 // Constants
 const (
-	redirectURI         = "http://127.0.0.1:8888/callback"
-	historyFileName     = "spotify_history.json"
-	historyPlaylistName = "History"
-	configFile          = "config.json"
-	monitorInterval     = 30 * time.Second
-	syncInterval        = 30 * time.Minute
-	maxLogLines         = 50 // internal buffer; display cap is dynamic
+	redirectURI     = "http://127.0.0.1:8888/callback"
+	historyFileName = "spotify_history.json"
+	configFile      = "config.json"
+	monitorInterval = 30 * time.Second
+	syncInterval    = 30 * time.Minute
+	maxLogLines     = 50
 )
 
 // Styles
@@ -59,12 +60,22 @@ var (
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("238")).
 			MarginTop(1)
+
+	promptTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("205")).
+				MarginBottom(1)
+
+	promptSubtitleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("244")).
+				MarginBottom(1)
 )
 
 // Structs
 type Config struct {
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
+	PlaylistName string `json:"playlist_name"`
 }
 
 type UserProfile struct {
@@ -117,25 +128,85 @@ type PlaylistTracksPaging struct {
 	Next  string          `json:"next"`
 }
 
-// Bubble Tea Model
-type model struct {
-	config      *oauth2.Config
-	client      *http.Client
-	userID      string
-	displayName string
-	playlistID  string
-	history     map[string]SimplifiedTrack
-	spinner     spinner.Model
-	status      string // current (possibly temporary) status line
-	idleStatus  string // baseline status to return to after an operation
-	logs        []string
-	err         error
-	quitting    bool
-	width       int
-	height      int
+// Playlist prompt model
+
+type promptModel struct {
+	input    textinput.Model
+	quitting bool
+	done     bool
 }
 
-// Bubble Tea Messages
+func newPromptModel(current string) promptModel {
+	ti := textinput.New()
+	ti.Placeholder = "History"
+	ti.Focus()
+	ti.CharLimit = 100
+	ti.Width = 40
+	if current != "" {
+		ti.SetValue(current)
+	}
+	return promptModel{input: ti}
+}
+
+func (m promptModel) Init() tea.Cmd {
+	return textinput.Blink
+}
+
+func (m promptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			m.quitting = true
+			return m, tea.Quit
+		case "enter":
+			if strings.TrimSpace(m.input.Value()) == "" {
+				m.input.SetValue("History")
+			}
+			m.done = true
+			return m, tea.Quit
+		}
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+func (m promptModel) View() string {
+	if m.quitting {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(promptTitleStyle.Render("bubbl"))
+	b.WriteString("\n")
+	b.WriteString(promptSubtitleStyle.Render("Which playlist should bubbl save your history to?"))
+	b.WriteString("\n\n")
+	b.WriteString(m.input.View())
+	b.WriteString("\n\n")
+	b.WriteString(helpStyle.Render("enter to confirm  ctrl+c to cancel"))
+	return b.String()
+}
+
+// Main TUI model
+
+type model struct {
+	config       *oauth2.Config
+	client       *http.Client
+	userID       string
+	displayName  string
+	playlistID   string
+	playlistName string
+	history      map[string]SimplifiedTrack
+	spinner      spinner.Model
+	status       string
+	idleStatus   string
+	logs         []string
+	err          error
+	quitting     bool
+	width        int
+	height       int
+}
+
 type setupDoneMsg struct {
 	client      *http.Client
 	userID      string
@@ -152,49 +223,144 @@ type monitorTickMsg struct{}
 type syncTickMsg struct{}
 
 func monitorTick() tea.Cmd {
-	return tea.Tick(monitorInterval, func(t time.Time) tea.Msg {
-		return monitorTickMsg{}
-	})
+	return tea.Tick(monitorInterval, func(t time.Time) tea.Msg { return monitorTickMsg{} })
 }
 
 func syncTick() tea.Cmd {
-	return tea.Tick(syncInterval, func(t time.Time) tea.Msg {
-		return syncTickMsg{}
-	})
+	return tea.Tick(syncInterval, func(t time.Time) tea.Msg { return syncTickMsg{} })
 }
 
-// Main
 func main() {
-	m := initialModel()
+	// --- Flags ---
+	setPlaylist := flag.String("set-playlist", "", "set the playlist name bubbl saves history to")
+	flag.Parse()
+
+	// --- Load or bootstrap config ---
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("could not load config: %v", err)
+	}
+
+	// Handle --set-playlist flag
+	if *setPlaylist != "" {
+		cfg.PlaylistName = strings.TrimSpace(*setPlaylist)
+		if err := saveConfig(cfg); err != nil {
+			log.Fatalf("could not save config: %v", err)
+		}
+		fmt.Printf("Playlist set to %q\n", cfg.PlaylistName)
+		return
+	}
+
+	// If no playlist name is set, prompt for one interactively
+	if cfg.PlaylistName == "" {
+		pm := newPromptModel("")
+		p := tea.NewProgram(pm)
+		result, err := p.Run()
+		if err != nil {
+			log.Fatalf("prompt error: %v", err)
+		}
+		final := result.(promptModel)
+		if final.quitting {
+			return
+		}
+		cfg.PlaylistName = strings.TrimSpace(final.input.Value())
+		if cfg.PlaylistName == "" {
+			cfg.PlaylistName = "History"
+		}
+		if err := saveConfig(cfg); err != nil {
+			log.Fatalf("could not save config: %v", err)
+		}
+	}
+
+	// --- Launch main TUI ---
+	m := initialModel(cfg.PlaylistName)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v\n", err)
+		fmt.Printf("error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func initialModel() model {
+func initialModel(playlistName string) model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
-
 	return model{
-		spinner: s,
-		status:  "Initializing and authenticating...",
-		history: make(map[string]SimplifiedTrack),
-		logs:    make([]string, 0, maxLogLines),
+		spinner:      s,
+		status:       "Initializing and authenticating...",
+		playlistName: playlistName,
+		history:      make(map[string]SimplifiedTrack),
+		logs:         make([]string, 0, maxLogLines),
 	}
 }
 
-// Tea Init
 func (m model) Init() tea.Cmd {
-	return tea.Batch(
-		m.spinner.Tick,
-		doInitialSetup,
-	)
+	return tea.Batch(m.spinner.Tick, m.doInitialSetup())
 }
 
-// Event loop
+func (m model) doInitialSetup() tea.Cmd {
+	playlistName := m.playlistName
+	return func() tea.Msg {
+		ctx := context.Background()
+
+		config, err := loadConfig()
+		if err != nil {
+			return errorMsg{fmt.Errorf("error loading config.json: %w", err)}
+		}
+
+		conf := &oauth2.Config{
+			ClientID:     config.ClientID,
+			ClientSecret: config.ClientSecret,
+			RedirectURL:  redirectURI,
+			Scopes: []string{
+				"user-read-recently-played", "user-read-currently-playing",
+				"playlist-modify-public", "playlist-modify-private", "playlist-read-private",
+				"playlist-read-collaborative",
+			},
+			Endpoint: spotify.Endpoint,
+		}
+
+		client, err := getClient(ctx, conf)
+		if err != nil {
+			return errorMsg{fmt.Errorf("could not get http client: %w", err)}
+		}
+
+		userID, displayName, err := getUserID(ctx, client)
+		if err != nil {
+			return errorMsg{fmt.Errorf("could not get user ID: %w", err)}
+		}
+
+		history, err := loadHistory()
+		if err != nil {
+			return errorMsg{fmt.Errorf("could not load history: %w", err)}
+		}
+
+		playlistID, err := getOrCreatePlaylist(ctx, client, userID, playlistName)
+		if err != nil {
+			return errorMsg{fmt.Errorf("could not get/create playlist: %w", err)}
+		}
+
+		history, newTracksFound, err := syncPlaylistToHistory(ctx, client, playlistID, history)
+		if err != nil {
+			return errorMsg{fmt.Errorf("could not sync with playlist: %w", err)}
+		}
+
+		if newTracksFound > 0 {
+			if err := writeHistory(history); err != nil {
+				return errorMsg{fmt.Errorf("could not save synced history: %w", err)}
+			}
+		}
+
+		return setupDoneMsg{
+			client:      client,
+			userID:      userID,
+			displayName: displayName,
+			playlistID:  playlistID,
+			history:     history,
+		}
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if errMsg, ok := msg.(errorMsg); ok {
 		m.err = errMsg.err
@@ -225,18 +391,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if name == "" {
 			name = m.userID
 		}
-		idle := fmt.Sprintf("Monitoring '%s' → playlist '%s'", name, historyPlaylistName)
+		idle := fmt.Sprintf("Monitoring '%s' > playlist '%s'", name, m.playlistName)
 		m.status = idle
 		m.idleStatus = idle
 		m.history = msg.history
 		m.addLog(fmt.Sprintf("Loaded %d tracks from local cache.", len(m.history)))
 		m.addLog("Performing initial sync of recently played songs...")
 		m.status = "Syncing recently played..."
-		return m, tea.Batch(
-			monitorTick(),
-			syncTick(),
-			syncRecentlyPlayed(m.client),
-		)
+		return m, tea.Batch(monitorTick(), syncTick(), syncRecentlyPlayed(m.client))
 
 	case monitorTickMsg:
 		cmds := []tea.Cmd{monitorTick()}
@@ -296,9 +458,8 @@ func (m *model) addLog(s string) {
 	}
 }
 
-// visibleLogCount returns how many log lines fit in the current terminal.
 func (m model) visibleLogCount() int {
-	reserved := 9 // title, status, header, help, margins
+	reserved := 9
 	available := m.height - reserved
 	if available < 3 {
 		return 3
@@ -309,12 +470,10 @@ func (m model) visibleLogCount() int {
 	return available
 }
 
-// Render
 func (m model) View() string {
 	if m.quitting {
 		return "Shutting down...\n"
 	}
-
 	if m.err != nil {
 		return fmt.Sprintf("\n%s\n\n%s\n\n%s\n",
 			errorStyle.Render("Error: "+m.status),
@@ -324,7 +483,6 @@ func (m model) View() string {
 	}
 
 	var b strings.Builder
-
 	b.WriteString(titleStyle.Render("bubbl - Spotify History Monitor"))
 	b.WriteString("\n")
 
@@ -350,67 +508,7 @@ func (m model) View() string {
 	return b.String()
 }
 
-//  Commands
-
-func doInitialSetup() tea.Msg {
-	ctx := context.Background()
-
-	config, err := loadConfig()
-	if err != nil {
-		return errorMsg{fmt.Errorf("error loading config.json: %w", err)}
-	}
-
-	conf := &oauth2.Config{
-		ClientID:     config.ClientID,
-		ClientSecret: config.ClientSecret,
-		RedirectURL:  redirectURI,
-		Scopes: []string{
-			"user-read-recently-played", "user-read-currently-playing",
-			"playlist-modify-public", "playlist-modify-private", "playlist-read-private",
-			"playlist-read-collaborative",
-		},
-		Endpoint: spotify.Endpoint,
-	}
-
-	client, err := getClient(ctx, conf)
-	if err != nil {
-		return errorMsg{fmt.Errorf("could not get http client: %w", err)}
-	}
-
-	userID, displayName, err := getUserID(ctx, client)
-	if err != nil {
-		return errorMsg{fmt.Errorf("could not get user ID: %w", err)}
-	}
-
-	history, err := loadHistory()
-	if err != nil {
-		return errorMsg{fmt.Errorf("could not load history: %w", err)}
-	}
-
-	playlistID, err := getOrCreatePlaylist(ctx, client, userID, historyPlaylistName)
-	if err != nil {
-		return errorMsg{fmt.Errorf("could not get/create playlist: %w", err)}
-	}
-
-	history, newTracksFound, err := syncPlaylistToHistory(ctx, client, playlistID, history)
-	if err != nil {
-		return errorMsg{fmt.Errorf("could not sync with playlist: %w", err)}
-	}
-
-	if newTracksFound > 0 {
-		if err := writeHistory(history); err != nil {
-			return errorMsg{fmt.Errorf("could not save synced history: %w", err)}
-		}
-	}
-
-	return setupDoneMsg{
-		client:      client,
-		userID:      userID,
-		displayName: displayName,
-		playlistID:  playlistID,
-		history:     history,
-	}
-}
+// Commands
 
 func checkCurrentlyPlaying(client *http.Client) tea.Cmd {
 	return func() tea.Msg {
@@ -496,7 +594,6 @@ func syncRecentlyPlayed(client *http.Client) tea.Cmd {
 				return errorMsg{fmt.Errorf("error decoding recently played: %w", err)}
 			}
 
-			// Append oldest-first so history is in chronological order
 			for i := len(result.Items) - 1; i >= 0; i-- {
 				item := result.Items[i].Track
 				allTracks = append(allTracks, SimplifiedTrack{
@@ -574,7 +671,6 @@ func addTracksToPlaylist(client *http.Client, playlistID string, tracks []Simpli
 	}
 }
 
-// saveHistory is a tea.Cmd wrapper around writeHistory.
 func saveHistory(history map[string]SimplifiedTrack) tea.Cmd {
 	return func() tea.Msg {
 		if err := writeHistory(history); err != nil {
@@ -584,8 +680,6 @@ func saveHistory(history map[string]SimplifiedTrack) tea.Cmd {
 	}
 }
 
-// writeHistory writes history to disk atomically via a temp file + rename,
-// preventing data loss if the process is killed mid-write.
 func writeHistory(history map[string]SimplifiedTrack) error {
 	dir := filepath.Dir(historyFileName)
 	if dir == "" {
@@ -618,7 +712,7 @@ func writeHistory(history map[string]SimplifiedTrack) error {
 	return nil
 }
 
-//  Spotify API helpers
+// Spotify API helpers
 
 func syncPlaylistToHistory(ctx context.Context, client *http.Client, playlistID string, history map[string]SimplifiedTrack) (map[string]SimplifiedTrack, int, error) {
 	url := fmt.Sprintf("https://api.spotify.com/v1/playlists/%s/tracks?limit=50", playlistID)
@@ -649,7 +743,7 @@ func syncPlaylistToHistory(ctx context.Context, client *http.Client, playlistID 
 
 		for _, item := range page.Items {
 			if item.Track.ID == "" {
-				continue // skip local/podcast tracks with no Spotify ID
+				continue
 			}
 			if _, exists := history[item.Track.ID]; !exists {
 				history[item.Track.ID] = SimplifiedTrack{
@@ -683,7 +777,6 @@ func getClient(ctx context.Context, conf *oauth2.Config) (*http.Client, error) {
 		return oauth2.NewClient(ctx, tokenSource), nil
 	}
 
-	// OAuth flow: use a dedicated mux to avoid conflicts with the default ServeMux.
 	ch := make(chan *oauth2.Token, 1)
 	errCh := make(chan error, 1)
 
@@ -702,13 +795,11 @@ func getClient(ctx context.Context, conf *oauth2.Config) (*http.Client, error) {
 			return
 		}
 
-		// Write and flush the response BEFORE blocking on the channel send,
-		// so the browser gets the success page regardless of shutdown timing.
 		fmt.Fprint(w, "Authentication successful! You can close this window.")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		ch <- tok // blocks until caller receives; handler returns cleanly after
+		ch <- tok
 	})
 
 	go func() {
@@ -723,8 +814,6 @@ func getClient(ctx context.Context, conf *oauth2.Config) (*http.Client, error) {
 
 	select {
 	case tok := <-ch:
-		// Shut down the server after receiving the token (not inside the handler),
-		// so the handler has already returned and the response is fully flushed.
 		go server.Shutdown(context.Background()) //nolint:errcheck
 		saveToken(tokenFile, tok)
 		return conf.Client(ctx, tok), nil
@@ -759,8 +848,6 @@ func getUserID(ctx context.Context, client *http.Client) (id, displayName string
 	return profile.ID, profile.DisplayName, nil
 }
 
-// loadHistory reads the local history cache. Returns an empty map (no error)
-// if the file simply doesn't exist yet, and a real error for anything else.
 func loadHistory() (map[string]SimplifiedTrack, error) {
 	history := make(map[string]SimplifiedTrack)
 
@@ -774,7 +861,6 @@ func loadHistory() (map[string]SimplifiedTrack, error) {
 	defer file.Close()
 
 	if err := json.NewDecoder(file).Decode(&history); err != nil {
-		// Corrupted cache: warn and start fresh rather than crashing.
 		fmt.Fprintf(os.Stderr, "Warning: could not decode history file, starting fresh: %v\n", err)
 		return make(map[string]SimplifiedTrack), nil
 	}
@@ -818,7 +904,6 @@ func getOrCreatePlaylist(ctx context.Context, client *http.Client, userID, name 
 		url = playlists.Next
 	}
 
-	// Not found — create it.
 	payload, err := json.Marshal(map[string]any{
 		"name":        name,
 		"public":      false,
@@ -873,7 +958,18 @@ func loadConfig() (*Config, error) {
 	return &config, nil
 }
 
-//  Utility helpers
+func saveConfig(cfg *Config) error {
+	f, err := os.OpenFile(configFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(cfg)
+}
+
+// Utility helpers
 
 func getArtistsString(artists []Artist) string {
 	names := make([]string, len(artists))
@@ -889,7 +985,6 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 		return nil, err
 	}
 	defer f.Close()
-
 	tok := &oauth2.Token{}
 	return tok, json.NewDecoder(f).Decode(tok)
 }
@@ -909,7 +1004,6 @@ func saveToken(path string, token *oauth2.Token) {
 func openBrowser(url string) {
 	var cmd string
 	var args []string
-
 	switch runtime.GOOS {
 	case "linux":
 		cmd, args = "xdg-open", []string{url}
@@ -921,7 +1015,6 @@ func openBrowser(url string) {
 		log.Printf("Unsupported platform; open this URL manually: %s", url)
 		return
 	}
-
 	if err := exec.Command(cmd, args...).Start(); err != nil {
 		log.Printf("Could not open browser: %v", err)
 	}
